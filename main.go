@@ -107,10 +107,11 @@ const (
 type answerType int
 
 const (
-	AnswerNo     answerType = 0
-	AnswerYes    answerType = 1
-	AnswerCustom answerType = 2
-	AnswerCancel answerType = -1
+	AnswerNo      answerType = 0
+	AnswerYes     answerType = 1
+	AnswerCustom  answerType = 2
+	AnswerQRReady answerType = 3
+	AnswerCancel  answerType = -1
 )
 
 type contact struct {
@@ -151,7 +152,17 @@ func mainAction(c *cli.Context) error {
 	for idx, cnt := range contactLst {
 		logger.Debug().Interface("c", cnt).Msgf("%d", idx+1)
 
-		if cnt.Answer == AnswerCustom {
+		if cnt.Answer == AnswerQRReady {
+			var imgFname string
+			if fname := strings.Trim(cnt.VcfFname, defaultVCFExtension); fname != "" {
+				imgFname = fmt.Sprintf("%s.png", fname)
+			}
+			if _, err := os.Stat(imgFname); err != nil { // errors.Is(err, os.ErrNotExist)
+				logger.Error().Err(err).Interface("cnt", cnt).Msg("the record required QR Code Image, which has error")
+				return err
+			}
+			continue
+		} else if cnt.Answer == AnswerCustom {
 			if _, err := os.Stat(cnt.VcfFname); err != nil { // errors.Is(err, os.ErrNotExist)
 				logger.Error().Err(err).Interface("cnt", cnt).Msg("the record required customized vCard, which has error")
 				return err
