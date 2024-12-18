@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog/log"
 	qrcode "github.com/skip2/go-qrcode"
 	"github.com/urfave/cli/v2"
+	"github.com/xuri/excelize/v2"
 )
 
 const cmdToolVersion = "v0.0.1"
@@ -75,6 +76,11 @@ func main() {
 				Aliases: []string{"l"},
 				Usage:   "list of all contacts",
 			},
+			&cli.StringFlag{
+				Name:    "excel",
+				Aliases: []string{"e"},
+				Usage:   "output excel files to include the class, name and QR code image; this option must be used with input 'list' file",
+			},
 		},
 		Before: func(c *cli.Context) error {
 			if c.Bool("debug") {
@@ -108,37 +114,45 @@ type contact struct {
 func mainAction(c *cli.Context) error {
 	logger := log.Ctx(c.Context)
 
-	dataFolder := c.String("folder")
-	lstFname := c.String("list")
-
-	if lstFname != "" {
-		contactLst, err := parseInputList(c.Context, dataFolder, lstFname)
-		if err != nil {
-			return err
-		}
-		logger.Info().Msgf("read %d contacts", len(contactLst))
-
-		for idx, cnt := range contactLst {
-			logger.Debug().Interface("c", cnt).Msgf("%d", idx+1)
-			if _, err := os.Stat(cnt.VcfFname); errors.Is(err, os.ErrNotExist) {
-				// vCard file is not exist
-				if err := generateVCard(c.Context, cnt); err != nil {
-					return err
-				}
-			}
-			if err := geneateQRCodeByFile(cnt.VcfFname); err != nil {
+	if c.NArg() > 0 {
+		for _, vcfFname := range c.Args().Slice() {
+			if err := geneateQRCodeByFile(vcfFname); err != nil {
 				return err
 			}
 		}
-
 	}
 
-	if c.NArg() == 0 {
+	dataFolder := c.String("folder")
+	lstFname := c.String("list")
+	outExcelFname := c.String("excel")
+
+	if lstFname == "" {
 		return nil
 	}
 
-	for _, vcfFname := range c.Args().Slice() {
-		if err := geneateQRCodeByFile(vcfFname); err != nil {
+	// followings are work with the input list file
+	contactLst, err := parseInputList(c.Context, dataFolder, lstFname)
+	if err != nil {
+		return err
+	}
+	logger.Info().Msgf("read %d contacts", len(contactLst))
+
+	for idx, cnt := range contactLst {
+		logger.Debug().Interface("c", cnt).Msgf("%d", idx+1)
+		if _, err := os.Stat(cnt.VcfFname); errors.Is(err, os.ErrNotExist) {
+			// vCard file is not exist
+			if err := generateVCard(c.Context, cnt); err != nil {
+				return err
+			}
+		}
+		if err := geneateQRCodeByFile(cnt.VcfFname); err != nil {
+			return err
+		}
+	}
+
+	if outExcelFname != "" {
+		outExcelFname = filepath.Join(dataFolder, outExcelFname)
+		if err := generateExcelFile(c.Context, outExcelFname, contactLst); err != nil {
 			return err
 		}
 	}
@@ -246,5 +260,153 @@ func generateVCard(ctx context.Context, cnt *contact) error {
 	}
 
 	logger.Trace().Msg("vCard generated")
+	return nil
+}
+
+func generateExcelFile(ctx context.Context, outFname string, contactList []*contact) error {
+	logger := log.Ctx(ctx).With().Str("out", outFname).Logger()
+	fout := excelize.NewFile()
+	defer func() {
+		if err := fout.Close(); err != nil {
+			logger.Error().Err(err).Msg("error to generate the excel file")
+		}
+	}()
+
+	if err := fillListSheet(ctx, fout, contactList); err != nil {
+		return err
+	}
+	if err := genQRCodeSheet(ctx, fout, contactList); err != nil {
+		return err
+	}
+
+	// Save spreadsheet by the given path.
+	if err := fout.SaveAs(outFname); err != nil {
+		return err
+	}
+
+	logger.Info().Msg("Excel output done!")
+	return nil
+}
+
+func fillListSheet(ctx context.Context, fout *excelize.File, contactList []*contact) error {
+	const sheet1Name = "Sheet1"
+
+	logger := log.Ctx(ctx)
+
+	// set header
+	if err := fout.SetCellValue(sheet1Name, "A1", "class"); err != nil {
+		return err
+	}
+	if err := fout.SetCellValue(sheet1Name, "B1", "name"); err != nil {
+		return err
+	}
+
+	for idx, cnt := range contactList {
+		rowID := strconv.FormatInt(int64(idx+2), 10)
+		if err := fout.SetCellValue(sheet1Name, "A"+rowID, cnt.Class); err != nil {
+			logger.Error().Err(err).Msg("error to set contact class")
+			break
+		}
+		if err := fout.SetCellValue(sheet1Name, "B"+rowID, cnt.Fullname); err != nil {
+			logger.Error().Err(err).Msg("error to set contact name")
+			break
+		}
+	}
+
+	return nil
+}
+
+func genQRCodeSheet(ctx context.Context, fout *excelize.File, contactList []*contact) error {
+	const sheet2Name = "Sheet2"
+
+	logger := log.Ctx(ctx)
+	// Create a new sheet.
+	if _, err := fout.NewSheet(sheet2Name); err != nil {
+		return err
+	}
+
+	// a4Size := int(9)
+	// fout.SetPageLayout(sheetName, &excelize.PageLayoutOptions{Size: &a4Size})
+	mB := float64(0.04)
+	mF := float64(0.3)
+	mL := float64(0.7)
+	vhCenter := true
+	if err := fout.SetPageMargins(sheet2Name, &excelize.PageLayoutMarginsOptions{
+		Bottom:       &mB,
+		Footer:       &mF,
+		Header:       &mF,
+		Top:          &mB,
+		Left:         &mL,
+		Right:        &mL,
+		Horizontally: &vhCenter,
+		Vertically:   &vhCenter,
+	}); err != nil {
+		return err
+	}
+
+	// set column width, style...
+	fout.SetColWidth(sheet2Name, "A", "B", 36)
+	txtStyleID, err := fout.NewStyle(&excelize.Style{
+		Alignment: &excelize.Alignment{Horizontal: "center"},
+		Border: []excelize.Border{
+			{Type: "top", Style: 2, Color: "000000"},
+			{Type: "left", Style: 2, Color: "000000"},
+			{Type: "right", Style: 2, Color: "000000"},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	imgStyleID, err := fout.NewStyle(&excelize.Style{
+		Alignment: &excelize.Alignment{Horizontal: "center"},
+		Border: []excelize.Border{
+			{Type: "left", Style: 2, Color: "000000"},
+			{Type: "right", Style: 2, Color: "000000"},
+			{Type: "bottom", Style: 2, Color: "000000"},
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	enabled := true
+	defGraphicOpts := &excelize.GraphicOptions{
+		PrintObject:     &enabled,
+		LockAspectRatio: true,
+		// AutoFit:         true,
+		OffsetX:     16,
+		OffsetY:     1,
+		ScaleX:      0.78,
+		ScaleY:      0.711,
+		Positioning: "oneCell",
+	}
+	for idx, cnt := range contactList {
+		rowID := int(idx/2)*2 + 1
+		var colID = "A"
+		if (idx % 2) == 0 {
+			// set row height
+			// fout.SetRowHeight(sheetName, rowID, 15) // use standard
+			fout.SetRowHeight(sheet2Name, rowID+1, 155)
+		} else {
+			colID = "B"
+		}
+		txtCellID := colID + strconv.FormatInt(int64(rowID), 10)
+		imgCellID := colID + strconv.FormatInt(int64(rowID+1), 10)
+
+		cellText := cnt.Class + " " + cnt.Fullname
+		imgFname := strings.ReplaceAll(cnt.VcfFname, defaultVCFExtension, ".png")
+
+		fout.SetCellStyle(sheet2Name, txtCellID, txtCellID, txtStyleID)
+		if err := fout.SetCellValue(sheet2Name, txtCellID, cellText); err != nil {
+			logger.Error().Err(err).Msg("error to set QR title")
+			break
+		}
+
+		fout.SetCellStyle(sheet2Name, imgCellID, imgCellID, imgStyleID)
+		if err := fout.AddPicture(sheet2Name, imgCellID, imgFname, defGraphicOpts); err != nil {
+			logger.Error().Err(err).Msg("error to add QR code")
+			break
+		}
+	}
 	return nil
 }
