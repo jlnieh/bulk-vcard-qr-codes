@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/csv"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +16,8 @@ import (
 	qrcode "github.com/skip2/go-qrcode"
 	"github.com/urfave/cli/v2"
 	"github.com/xuri/excelize/v2"
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 )
 
 const cmdToolVersion = "v0.0.1"
@@ -74,7 +75,7 @@ func main() {
 			&cli.StringFlag{
 				Name:    "list",
 				Aliases: []string{"l"},
-				Usage:   "list of all contacts",
+				Usage:   "list of all contacts; which is exported from Excel with TAB delimiter and UTF-16 LE encoding with BOM",
 			},
 			&cli.StringFlag{
 				Name:    "excel",
@@ -103,12 +104,22 @@ const (
 	defaultVCFExtension = ".vcf"
 )
 
+type answerType int
+
+const (
+	AnswerNo     answerType = 0
+	AnswerYes    answerType = 1
+	AnswerCustom answerType = 2
+	AnswerCancel answerType = -1
+)
+
 type contact struct {
 	Class    string
 	Fullname string
 	VcfFname string
 	Cell     string
 	Email    string
+	Answer   answerType
 }
 
 func mainAction(c *cli.Context) error {
@@ -139,12 +150,16 @@ func mainAction(c *cli.Context) error {
 
 	for idx, cnt := range contactLst {
 		logger.Debug().Interface("c", cnt).Msgf("%d", idx+1)
-		if _, err := os.Stat(cnt.VcfFname); errors.Is(err, os.ErrNotExist) {
-			// vCard file is not exist
-			if err := generateVCard(c.Context, cnt); err != nil {
+
+		if cnt.Answer == AnswerCustom {
+			if _, err := os.Stat(cnt.VcfFname); err != nil { // errors.Is(err, os.ErrNotExist)
+				logger.Error().Err(err).Interface("cnt", cnt).Msg("the record required customized vCard, which has error")
 				return err
 			}
+		} else if err := generateVCard(c.Context, cnt); err != nil { // vCard file is not exist
+			return err
 		}
+
 		if err := geneateQRCodeByFile(cnt.VcfFname); err != nil {
 			return err
 		}
@@ -187,7 +202,12 @@ func parseInputList(ctx context.Context, dataFolder, lstFname string) ([]*contac
 	}
 	defer fin.Close()
 
-	r := csv.NewReader(fin)
+	// Create a UTF-16 decoder
+	decoder := unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewDecoder()
+
+	r := csv.NewReader(transform.NewReader(fin, decoder))
+	r.Comma = '\t' // Set the delimiter to tab
+
 	contactLst := make([]*contact, 0)
 	for {
 		rec, err := r.Read()
@@ -198,9 +218,13 @@ func parseInputList(ctx context.Context, dataFolder, lstFname string) ([]*contac
 			return nil, err
 		}
 
+		if rec[0] == "no" {
+			continue // the first line
+		}
+
 		if v, err := strconv.ParseInt(rec[0], 10, 64); err != nil || v == 0 {
 			if err != nil {
-				logger.Debug().Err(err).Msgf("error to parse the row: %s", rec)
+				logger.Error().Err(err).Msgf("error to parse the row: %s", rec)
 			}
 			continue
 		}
@@ -211,6 +235,16 @@ func parseInputList(ctx context.Context, dataFolder, lstFname string) ([]*contac
 		oneContact.VcfFname = filepath.Join(dataFolder, rec[3]+defaultVCFExtension)
 		oneContact.Cell = formatCellNo(rec[4])
 		oneContact.Email = rec[5]
+		if v, err := strconv.ParseInt(rec[6], 10, 64); err != nil || v < 0 {
+			if err != nil {
+				logger.Error().Err(err).Msgf("error to parse the answer of the row: %s", rec)
+			} else {
+				logger.Debug().Msgf("skip the cancelled record: %s", rec)
+			}
+			continue
+		} else {
+			oneContact.Answer = answerType(v)
+		}
 
 		contactLst = append(contactLst, oneContact)
 	}
@@ -241,14 +275,18 @@ func generateVCard(ctx context.Context, cnt *contact) error {
 	// N
 	nRunes := []rune(cnt.Fullname)
 	sb.WriteString(fmt.Sprintf("N:%s;%s;;;\n", string(nRunes[0]), string(nRunes[1:])))
-	// Email
-	if cnt.Email != "" {
-		sb.WriteString(fmt.Sprintf("EMAIL;TYPE=INTERNET;TYPE=WORK:%s\n", cnt.Email))
+
+	if cnt.Answer == AnswerYes {
+		// Email
+		if cnt.Email != "" {
+			sb.WriteString(fmt.Sprintf("EMAIL;TYPE=INTERNET;TYPE=WORK:%s\n", cnt.Email))
+		}
+		// TEL/CELL
+		if cnt.Cell != "" {
+			sb.WriteString(fmt.Sprintf("TEL;TYPE=CELL:%s\n", cnt.Cell))
+		}
 	}
-	// TEL/CELL
-	if cnt.Cell != "" {
-		sb.WriteString(fmt.Sprintf("TEL;TYPE=CELL:%s\n", cnt.Cell))
-	}
+
 	// NOTE
 	sb.WriteString(fmt.Sprintf("NOTE:建中42屆%s班同學\n", cnt.Class))
 
